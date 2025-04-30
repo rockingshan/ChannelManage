@@ -15,7 +15,7 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
-from urllib.parse import urlparse  # New import for URL parsing
+from urllib.parse import urlparse
 
 def get_resource_path(filename):
     if hasattr(sys, '_MEIPASS'):
@@ -36,11 +36,23 @@ def get_encryption_key():
 def init_database():
     conn = sqlite3.connect(get_resource_path("servers.db"))
     cursor = conn.cursor()
+    # Servers table for credentials
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS servers (
             server_ip TEXT PRIMARY KEY,
             username TEXT NOT NULL,
             password TEXT NOT NULL
+        )
+    """)
+    # Channels table for processed CSV data
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            lcn TEXT PRIMARY KEY,
+            server_ip TEXT NOT NULL,
+            channel_name TEXT NOT NULL,
+            udp_ip TEXT NOT NULL,
+            udp_port TEXT NOT NULL,
+            http_url TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -54,9 +66,6 @@ class SSHExecutorApp:
         if os.path.exists(icon_path):
             self.root.iconbitmap(icon_path)
 
-        self.ssh_profiles = {}
-        self.udp_profiles = {}
-        self.http_profiles = {}
         self.vlc_path = "vlc"
         self.fernet = Fernet(get_encryption_key())  # Initialize Fernet for encryption
 
@@ -66,9 +75,7 @@ class SSHExecutorApp:
         top_frame = ttk.Frame(root)
         top_frame.pack(fill="x", padx=10, pady=10)
 
-        ttk.Button(top_frame, text="Import CSV", command=self.load_csv).pack(side="left", padx=5)
-        ttk.Button(top_frame, text="Export Template", command=self.export_template).pack(side="left", padx=5)
-        ttk.Button(top_frame, text="Process Raw CSV", command=self.process_raw_csv).pack(side="left", padx=5)  # New button
+        ttk.Button(top_frame, text="Process Raw CSV", command=self.process_raw_csv).pack(side="left", padx=5)
         ttk.Button(top_frame, text="Select VLC", command=self.select_vlc).pack(side="left", padx=5)
         ttk.Button(top_frame, text="Manage Servers", command=self.manage_servers).pack(side="left", padx=5)
 
@@ -106,14 +113,6 @@ class SSHExecutorApp:
     def process_raw_csv(self):
         file_path = filedialog.askopenfilename(filetypes=[["CSV Files", "*.csv"]])
         if not file_path:
-            return
-
-        output_file = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[["CSV Files", "*.csv"]],
-            title="Save Processed CSV"
-        )
-        if not output_file:
             return
 
         try:
@@ -157,59 +156,49 @@ class SSHExecutorApp:
                         "http_url": http_url
                     })
 
-            # Write processed data to output CSV
-            with open(output_file, "w", newline='', encoding='utf-8') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=["lcn", "server_ip", "channel_name", "udp_ip", "udp_port", "http_url"])
-                writer.writeheader()
-                for data in processed_data:
-                    writer.writerow(data)
+            # Save to database
+            conn = sqlite3.connect(get_resource_path("servers.db"))
+            cursor = conn.cursor()
+            # Truncate existing channels table
+            cursor.execute("DELETE FROM channels")
+            # Insert new data
+            for data in processed_data:
+                cursor.execute("""
+                    INSERT INTO channels (lcn, server_ip, channel_name, udp_ip, udp_port, http_url)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    data["lcn"],
+                    data["server_ip"],
+                    data["channel_name"],
+                    data["udp_ip"],
+                    data["udp_port"],
+                    data["http_url"]
+                ))
+            conn.commit()
+            conn.close()
 
-            messagebox.showinfo("Success", f"Processed CSV saved to {output_file}")
+            messagebox.showinfo("Success", "Raw CSV processed and saved to database.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to process CSV: {e}")
 
-    def load_csv(self):
-        file_path = filedialog.askopenfilename(filetypes=[["CSV Files", "*.csv"]])
-        if not file_path:
-            return
-
-        try:
-            with open(file_path, newline='') as csvfile:
-                reader = csv.DictReader(csvfile)
-                for row in reader:
-                    lcn = row.get("lcn", "").strip()
-                    if not lcn:
-                        continue
-                    self.ssh_profiles[lcn] = {
-                        "server_ip": row.get("server_ip", "").strip(),
-                        "channel_name": row.get("channel_name", "Unknown").strip()
-                    }
-                    udp_ip = row.get("udp_ip", "").strip()
-                    udp_port = row.get("udp_port", "").strip()
-                    if udp_ip and udp_port:
-                        self.udp_profiles[lcn] = f"udp://@{udp_ip}:{udp_port}"
-
-                    http_url = row.get("http_url", "").strip()
-                    if http_url:
-                        self.http_profiles[lcn] = http_url
-            messagebox.showinfo("Success", "CSV loaded successfully!")
-        except Exception as e:
-            messagebox.showerror("CSV Error", str(e))
-
-    def export_template(self):
-        file_path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                                 filetypes=[["CSV Files", "*.csv"]],
-                                                 title="Save CSV Template")
-        if not file_path:
-            return
-        try:
-            with open(file_path, "w", newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(["lcn", "server_ip", "channel_name", "udp_ip", "udp_port", "http_url"])
-                writer.writerow(["353", "192.168.1.100", "Example Channel", "239.0.0.1", "1234", "http://223.29.207.134:4022/udp/239.0.0.1:1234"])
-            messagebox.showinfo("Success", "Template exported successfully!")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to export template:\n{e}")
+    def get_channel_data(self, lcn):
+        conn = sqlite3.connect(get_resource_path("servers.db"))
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT server_ip, channel_name, udp_ip, udp_port, http_url
+            FROM channels WHERE lcn = ?
+        """, (lcn,))
+        result = cursor.fetchone()
+        conn.close()
+        if result:
+            return {
+                "server_ip": result[0],
+                "channel_name": result[1],
+                "udp_ip": result[2],
+                "udp_port": result[3],
+                "http_url": result[4]
+            }
+        return None
 
     def get_server_credentials(self, server_ip):
         conn = sqlite3.connect(get_resource_path("servers.db"))
@@ -395,20 +384,21 @@ class SSHExecutorApp:
                 self.execute_btn.config(state=tk.NORMAL)
 
         lcn = self.lcn_entry.get().strip()
-        if lcn not in self.ssh_profiles:
-            messagebox.showerror("Error", f"LCN {lcn} not found in profiles.")
+        profile = self.get_channel_data(lcn)
+        if not profile:
+            messagebox.showerror("Error", f"LCN {lcn} not found in database.")
             return
 
-        profile = self.ssh_profiles[lcn]
         self.execute_btn.config(state=tk.DISABLED)
         threading.Thread(target=worker, args=(profile, lcn)).start()
 
     def play_udp(self):
         lcn = self.lcn_entry.get().strip()
-        if lcn not in self.udp_profiles:
-            messagebox.showerror("UDP Error", f"No UDP profile found for LCN {lcn}.")
+        channel_data = self.get_channel_data(lcn)
+        if not channel_data:
+            messagebox.showerror("UDP Error", f"No channel data found for LCN {lcn}.")
             return
-        udp_url = self.udp_profiles[lcn]
+        udp_url = f"udp://@{channel_data['udp_ip']}:{channel_data['udp_port']}"
         try:
             subprocess.Popen([self.vlc_path, udp_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
@@ -416,10 +406,11 @@ class SSHExecutorApp:
 
     def play_http(self):
         lcn = self.lcn_entry.get().strip()
-        if lcn not in self.http_profiles:
-            messagebox.showerror("HTTP Error", f"No HTTP URL for LCN {lcn}.")
+        channel_data = self.get_channel_data(lcn)
+        if not channel_data:
+            messagebox.showerror("HTTP Error", f"No channel data found for LCN {lcn}.")
             return
-        http_url = self.http_profiles[lcn]
+        http_url = channel_data["http_url"]
         try:
             subprocess.Popen([self.vlc_path, http_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
@@ -460,11 +451,13 @@ class SSHExecutorApp:
 
     def auto_check_status(self):
         lcn = self.lcn_entry.get().strip()
-        http_url = self.http_profiles.get(lcn)
-        udp_url = self.udp_profiles.get(lcn)
-        if not http_url and not udp_url:
+        channel_data = self.get_channel_data(lcn)
+        if not channel_data:
             self.status_label.config(text="Status: Unknown ❓", foreground="gray")
             return
+
+        http_url = channel_data["http_url"]
+        udp_url = f"udp://@{channel_data['udp_ip']}:{channel_data['udp_port']}"
 
         def check_url(url):
             try:
