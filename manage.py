@@ -55,6 +55,13 @@ def init_database():
             http_url TEXT NOT NULL
         )
     """)
+    # Settings table for VLC path
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -66,11 +73,18 @@ class SSHExecutorApp:
         if os.path.exists(icon_path):
             self.root.iconbitmap(icon_path)
 
-        self.vlc_path = "vlc"
-        self.fernet = Fernet(get_encryption_key())  # Initialize Fernet for encryption
-
-        # Initialize database
+        # Initialize database first
         init_database()
+
+        # Load VLC path from database, default to "vlc" if not set
+        conn = sqlite3.connect(get_resource_path("servers.db"))
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = 'vlc_path'")
+        result = cursor.fetchone()
+        self.vlc_path = result[0] if result else "vlc"
+        conn.close()
+
+        self.fernet = Fernet(get_encryption_key())  # Initialize Fernet for encryption
 
         top_frame = ttk.Frame(root)
         top_frame.pack(fill="x", padx=10, pady=10)
@@ -420,6 +434,15 @@ class SSHExecutorApp:
         path = filedialog.askopenfilename(filetypes=[["VLC Executable", "vlc.exe" if os.name == 'nt' else "vlc"]])
         if path:
             self.vlc_path = path
+            # Save to database
+            try:
+                conn = sqlite3.connect(get_resource_path("servers.db"))
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("vlc_path", path))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save VLC path: {e}")
 
     def view_logs(self):
         log_file = f"command_log_{datetime.date.today().isoformat()}.txt"
