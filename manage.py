@@ -12,19 +12,31 @@ import socket
 import sys
 import sqlite3
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import base64
 from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 def get_resource_path(filename):
+    """Get path for bundled resources (e.g., app.ico) in PyInstaller --onefile mode."""
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, filename)
     return os.path.join(os.path.abspath("."), filename)
 
+def get_persistent_path(filename):
+    """Get path for persistent files (e.g., servers.db, key.key) in the executable's directory."""
+    if hasattr(sys, 'frozen'):
+        return os.path.join(os.path.dirname(sys.executable), filename)
+    return os.path.join(os.path.abspath("."), filename)
+
+def get_http_base_url():
+    """Get HTTP base URL from .env file, with a fallback placeholder."""
+    return os.getenv("HTTP_BASE_URL", "http://<YOUR_IP>:<YOUR_PORT>")
+
 # Initialize encryption key
 def get_encryption_key():
-    key_file = get_resource_path("key.key")
+    key_file = get_persistent_path("key.key")
     if not os.path.exists(key_file):
         key = Fernet.generate_key()
         with open(key_file, "wb") as f:
@@ -34,9 +46,8 @@ def get_encryption_key():
 
 # Initialize SQLite database
 def init_database():
-    conn = sqlite3.connect(get_resource_path("servers.db"))
+    conn = sqlite3.connect(get_persistent_path("servers.db"))
     cursor = conn.cursor()
-    # Servers table for credentials
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS servers (
             server_ip TEXT PRIMARY KEY,
@@ -44,7 +55,6 @@ def init_database():
             password TEXT NOT NULL
         )
     """)
-    # Channels table for processed CSV data
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             lcn TEXT PRIMARY KEY,
@@ -55,7 +65,6 @@ def init_database():
             http_url TEXT NOT NULL
         )
     """)
-    # Settings table for VLC path
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -69,22 +78,20 @@ class SSHExecutorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("LCN Channel Restart Tool")
-        icon_path = get_resource_path("Lyvelogo.ico")
+        icon_path = get_resource_path("app.ico")
         if os.path.exists(icon_path):
             self.root.iconbitmap(icon_path)
 
-        # Initialize database first
         init_database()
 
-        # Load VLC path from database, default to "vlc" if not set
-        conn = sqlite3.connect(get_resource_path("servers.db"))
+        conn = sqlite3.connect(get_persistent_path("servers.db"))
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM settings WHERE key = 'vlc_path'")
         result = cursor.fetchone()
         self.vlc_path = result[0] if result else "vlc"
         conn.close()
 
-        self.fernet = Fernet(get_encryption_key())  # Initialize Fernet for encryption
+        self.fernet = Fernet(get_encryption_key())
 
         top_frame = ttk.Frame(root)
         top_frame.pack(fill="x", padx=10, pady=10)
@@ -130,37 +137,32 @@ class SSHExecutorApp:
             return
 
         try:
+            http_base_url = get_http_base_url()
             processed_data = []
             with open(file_path, newline='', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
                 for row in reader:
-                    # Extract required fields
                     lcn = row.get("channel_number", "").strip()
                     channel_name = row.get("channel_name", "Unknown").strip()
                     input_url = row.get("input_url", "").strip()
                     udp_port = row.get("input_port", "").strip()
                     channel_ott_url = row.get("channel_ott_url", "").strip()
 
-                    # Validate required fields
                     if not lcn or not input_url or not udp_port or not channel_ott_url:
                         continue
 
-                    # Extract udp_ip from input_url (content after udp://@)
                     if input_url.startswith("udp://@"):
                         udp_ip = input_url[len("udp://@"):]
                     else:
-                        continue  # Skip invalid input_url
+                        continue
 
-                    # Extract server_ip from channel_ott_url
                     parsed_url = urlparse(channel_ott_url)
                     server_ip = parsed_url.hostname
                     if not server_ip:
-                        continue  # Skip if no hostname/IP found
+                        continue
 
-                    # Construct http_url
-                    http_url = f"http://223.29.207.134:4022/udp/{udp_ip}:{udp_port}"
+                    http_url = f"{http_base_url}/udp/{udp_ip}:{udp_port}"
 
-                    # Add to processed data
                     processed_data.append({
                         "lcn": lcn,
                         "server_ip": server_ip,
@@ -170,12 +172,9 @@ class SSHExecutorApp:
                         "http_url": http_url
                     })
 
-            # Save to database
-            conn = sqlite3.connect(get_resource_path("servers.db"))
+            conn = sqlite3.connect(get_persistent_path("servers.db"))
             cursor = conn.cursor()
-            # Truncate existing channels table
             cursor.execute("DELETE FROM channels")
-            # Insert new data
             for data in processed_data:
                 cursor.execute("""
                     INSERT INTO channels (lcn, server_ip, channel_name, udp_ip, udp_port, http_url)
@@ -196,7 +195,7 @@ class SSHExecutorApp:
             messagebox.showerror("Error", f"Failed to process CSV: {e}")
 
     def get_channel_data(self, lcn):
-        conn = sqlite3.connect(get_resource_path("servers.db"))
+        conn = sqlite3.connect(get_persistent_path("servers.db"))
         cursor = conn.cursor()
         cursor.execute("""
             SELECT server_ip, channel_name, udp_ip, udp_port, http_url
@@ -215,7 +214,7 @@ class SSHExecutorApp:
         return None
 
     def get_server_credentials(self, server_ip):
-        conn = sqlite3.connect(get_resource_path("servers.db"))
+        conn = sqlite3.connect(get_persistent_path("servers.db"))
         cursor = conn.cursor()
         cursor.execute("SELECT username, password FROM servers WHERE server_ip = ?", (server_ip,))
         result = cursor.fetchone()
@@ -235,21 +234,18 @@ class SSHExecutorApp:
         dialog.title("Manage Servers")
         dialog.geometry("600x400")
 
-        # Treeview to display servers
         tree = ttk.Treeview(dialog, columns=("server_ip", "username"), show="headings")
         tree.heading("server_ip", text="Server IP")
         tree.heading("username", text="Username")
         tree.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Load existing servers
-        conn = sqlite3.connect(get_resource_path("servers.db"))
+        conn = sqlite3.connect(get_persistent_path("servers.db"))
         cursor = conn.cursor()
         cursor.execute("SELECT server_ip, username FROM servers")
         for row in cursor.fetchall():
             tree.insert("", tk.END, values=row)
         conn.close()
 
-        # Buttons frame
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(fill="x", padx=10, pady=10)
 
@@ -258,29 +254,23 @@ class SSHExecutorApp:
             add_dialog.title("Add Server")
             add_dialog.geometry("400x300")
 
-            # Use a frame with grid layout
             form_frame = ttk.Frame(add_dialog)
             form_frame.pack(padx=10, pady=10, fill="both")
 
-            # Server IP
             ttk.Label(form_frame, text="Server IP:").grid(row=0, column=0, sticky="w", pady=5)
             server_ip_entry = ttk.Entry(form_frame)
             server_ip_entry.grid(row=0, column=1, sticky="ew", pady=5)
 
-            # Username
             ttk.Label(form_frame, text="Username:").grid(row=1, column=0, sticky="w", pady=5)
             username_entry = ttk.Entry(form_frame)
             username_entry.grid(row=1, column=1, sticky="ew", pady=5)
 
-            # Password
             ttk.Label(form_frame, text="Password:").grid(row=2, column=0, sticky="w", pady=5)
             password_entry = ttk.Entry(form_frame, show="*")
             password_entry.grid(row=2, column=1, sticky="ew", pady=5)
 
-            # Configure grid weights
             form_frame.columnconfigure(1, weight=1)
 
-            # Buttons frame
             button_frame = ttk.Frame(add_dialog)
             button_frame.pack(pady=10)
 
@@ -293,7 +283,7 @@ class SSHExecutorApp:
                     return
                 try:
                     encrypted_password = self.fernet.encrypt(password.encode()).decode()
-                    conn = sqlite3.connect(get_resource_path("servers.db"))
+                    conn = sqlite3.connect(get_persistent_path("servers.db"))
                     cursor = conn.cursor()
                     cursor.execute("INSERT OR REPLACE INTO servers (server_ip, username, password) VALUES (?, ?, ?)",
                                    (server_ip, username, encrypted_password))
@@ -305,7 +295,6 @@ class SSHExecutorApp:
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to add server: {e}")
 
-            # Save and Cancel buttons
             ttk.Button(button_frame, text="Save", command=save_server).pack(side="left", padx=5)
             ttk.Button(button_frame, text="Cancel", command=add_dialog.destroy).pack(side="left", padx=5)
 
@@ -319,7 +308,7 @@ class SSHExecutorApp:
                 return
             server_ip = tree.item(selected[0])["values"][0]
             if messagebox.askyesno("Confirm", f"Delete server {server_ip}?"):
-                conn = sqlite3.connect(get_resource_path("servers.db"))
+                conn = sqlite3.connect(get_persistent_path("servers.db"))
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM servers WHERE server_ip = ?", (server_ip,))
                 conn.commit()
@@ -373,16 +362,16 @@ class SSHExecutorApp:
                     self.output_box.see(tk.END)
                     self.output_box.update()
 
-                err = stderr.read().decode()
-                if err:
-                    self.output_box.insert(tk.END, "\nErrors:\n", "error")
-                    self.output_box.insert(tk.END, err, "error")
+                err = stderr.read().decode('utf-8', errors='replace')
 
                 self.output_box.insert(tk.END, "\n")
+                if err:
+                    self.output_box.insert(tk.END, "Errors:\n", "error")
+                    self.output_box.insert(tk.END, err, "error")
                 self.output_box.config(state=tk.DISABLED)
                 ssh.close()
 
-                with open(log_file, "a", encoding="utf-8", errors="ignore") as f:
+                with open(log_file, "a", encoding="utf-8-sig") as f:
                     f.write(f"{timestamp} | Server: {server_ip} | LCN: {lcn}\n")
                     f.write(f"Command: {command}\n")
                     f.write(f"Output:\n{output}\n")
@@ -398,6 +387,9 @@ class SSHExecutorApp:
                 self.execute_btn.config(state=tk.NORMAL)
 
         lcn = self.lcn_entry.get().strip()
+        if not lcn.isalnum():
+            messagebox.showerror("Error", "LCN must be alphanumeric.")
+            return
         profile = self.get_channel_data(lcn)
         if not profile:
             messagebox.showerror("Error", f"LCN {lcn} not found in database.")
@@ -434,9 +426,8 @@ class SSHExecutorApp:
         path = filedialog.askopenfilename(filetypes=[["VLC Executable", "vlc.exe" if os.name == 'nt' else "vlc"]])
         if path:
             self.vlc_path = path
-            # Save to database
             try:
-                conn = sqlite3.connect(get_resource_path("servers.db"))
+                conn = sqlite3.connect(get_persistent_path("servers.db"))
                 cursor = conn.cursor()
                 cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("vlc_path", path))
                 conn.commit()
@@ -461,7 +452,7 @@ class SSHExecutorApp:
         log_file = f"command_log_{datetime.date.today().isoformat()}.txt"
         if os.path.exists(log_file):
             try:
-                with open(log_file, "w", encoding="utf-8") as f:
+                with open(log_file, "w", encoding="utf-8-sig") as f:
                     f.write("")
                 messagebox.showinfo("Logs Cleared", "Log file cleared.")
             except Exception as e:
